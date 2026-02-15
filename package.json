@@ -1,6 +1,6 @@
 {
   "name": "hexcore-remill",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "N-API bindings for Remill — lifts machine code to LLVM IR bitcode",
   "main": "./index.js",
   "module": "./index.mjs",
@@ -69,7 +69,9 @@
     "README.md"
   ],
   "binary": {
-    "napi_versions": [8]
+    "napi_versions": [
+      8
+    ]
   },
   "devDependencies": {
     "prebuildify": "^6.0.0",
