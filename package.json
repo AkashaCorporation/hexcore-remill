@@ -13,7 +13,7 @@
     }
   },
   "scripts": {
-    "install": "prebuild-install -r napi || node-gyp rebuild",
+    "install": "node ../../scripts/hexcore-native-install.js",
     "build": "node-gyp rebuild",
     "build:debug": "node-gyp rebuild --debug",
     "prebuild": "prebuildify --napi --strip",
@@ -69,14 +69,7 @@
     "README.md"
   ],
   "binary": {
-    "napi_versions": [
-      8
-    ]
+    "napi_versions": [8]
   },
-  "devDependencies": {
-    "prebuildify": "^6.0.0",
-    "prebuild-install": "^7.1.0",
-    "node-addon-api": "^7.0.0",
-    "node-gyp": "^10.0.0"
-  }
+  "devDependencies": {}
 }
