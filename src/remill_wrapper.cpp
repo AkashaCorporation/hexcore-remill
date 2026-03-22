@@ -48,6 +48,20 @@
 #include <llvm/IR/GlobalAlias.h>
 #include <llvm/IR/IRBuilder.h>
 
+// LLVM New Pass Manager + optimization passes
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/IR/PassManager.h>
+#include <llvm/Transforms/Utils/Mem2Reg.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar/SimplifyCFG.h>
+#include <llvm/Transforms/Scalar/DCE.h>
+#include <llvm/Transforms/Scalar/ADCE.h>
+#include <llvm/Transforms/Scalar/DeadStoreElimination.h>
+#include <llvm/Transforms/Scalar/EarlyCSE.h>
+#include <llvm/Transforms/Scalar/SROA.h>
+#include <llvm/Analysis/CGSCCPassManager.h>
+#include <llvm/Analysis/LoopAnalysisManager.h>
+
 #include <sstream>
 #include <set>
 #include <vector>
@@ -62,6 +76,24 @@ __declspec(dllimport) void* __stdcall GetModuleHandleA(const char*);
 __declspec(dllimport) unsigned long __stdcall GetModuleFileNameA(void*, char*, unsigned long);
 }
 #endif
+
+static llvm::AllocaInst* FindNamedAlloca(llvm::Function* func, llvm::StringRef name) {
+	if (!func) {
+		return nullptr;
+	}
+
+	for (auto& inst : func->getEntryBlock()) {
+		auto* allocaInst = llvm::dyn_cast<llvm::AllocaInst>(&inst);
+		if (!allocaInst) {
+			continue;
+		}
+		if (allocaInst->getName() == name) {
+			return allocaInst;
+		}
+	}
+
+	return nullptr;
+}
 
 // Helper: resolve the semantics directory at runtime.
 //
@@ -263,8 +295,24 @@ Napi::Value RemillLifter::LiftBytes(const Napi::CallbackInfo& info) {
 		return env.Undefined();
 	}
 
+	// Parse optional lift options (3rd argument)
+	LiftOptions options;
+	if (info.Length() > 2 && info[2].IsObject()) {
+		auto opts = info[2].As<Napi::Object>();
+		if (opts.Has("maxInstructions") && opts.Get("maxInstructions").IsNumber())
+			options.maxInstructions = opts.Get("maxInstructions").As<Napi::Number>().Uint32Value();
+		if (opts.Has("maxBasicBlocks") && opts.Get("maxBasicBlocks").IsNumber())
+			options.maxBasicBlocks = opts.Get("maxBasicBlocks").As<Napi::Number>().Uint32Value();
+		if (opts.Has("maxBytes") && opts.Get("maxBytes").IsNumber())
+			options.maxBytes = opts.Get("maxBytes").As<Napi::Number>().Uint32Value();
+		if (opts.Has("splitAtCalls") && opts.Get("splitAtCalls").IsBoolean())
+			options.splitAtCalls = opts.Get("splitAtCalls").As<Napi::Boolean>().Value();
+		if (opts.Has("optimizeIR") && opts.Get("optimizeIR").IsBoolean())
+			options.optimizeIR = opts.Get("optimizeIR").As<Napi::Boolean>().Value();
+	}
+
 	try {
-		LiftResult result = DoLift(bytes, length, address);
+		LiftResult result = DoLift(bytes, length, address, options);
 		return LiftResultToJS(env, result);
 	} catch (const std::exception& e) {
 		LiftResult result;
@@ -369,7 +417,8 @@ Napi::Value RemillLifter::IsOpen(const Napi::CallbackInfo& info) {
 // ---------------------------------------------------------------------------
 
 LiftResult RemillLifter::DoLift(
-	const uint8_t* bytes, size_t length, uint64_t address) {
+	const uint8_t* bytes, size_t length, uint64_t address,
+	const LiftOptions& options) {
 
 	LiftResult result;
 	result.address = address;
@@ -387,8 +436,6 @@ LiftResult RemillLifter::DoLift(
 	}
 
 	// Clone the cached semantics module instead of reloading from disk.
-	// LoadArchSemantics reads ~50MB of .bc per call; CloneModule copies the
-	// in-memory IR in microseconds with zero disk I/O.
 	auto liftModule = llvm::CloneModule(*semanticsModule_);
 	if (!liftModule) {
 		result.error = "Failed to clone semantics module";
@@ -396,97 +443,518 @@ LiftResult RemillLifter::DoLift(
 	}
 
 	auto intrinsics = std::make_unique<remill::IntrinsicTable>(liftModule.get());
-
-	// DefaultLifter returns shared_ptr<OperandLifter>
 	auto lifter = arch_->DefaultLifter(*intrinsics);
-
-	// DefaultLifter always returns an InstructionLifterIntf-derived object.
-	// Use static_pointer_cast (dynamic_pointer_cast requires RTTI which is
-	// disabled by NAPI_DISABLE_CPP_EXCEPTIONS).
 	auto instLifter = std::static_pointer_cast<remill::InstructionLifterIntf>(lifter);
-
-	// Decode and lift each instruction
-	remill::Instruction inst;
-	uint64_t pc = address;
-	size_t offset = 0;
-
-	// Create a lifted function to hold the instructions
-	auto func = arch_->DeclareLiftedFunction(
-		"lifted_" + std::to_string(address), liftModule.get());
-	arch_->InitializeEmptyLiftedFunction(func);
-
-	auto block = &func->getEntryBlock();
 
 	// Create initial decoding context for this architecture
 	auto context = arch_->CreateInitialContext();
 
-	while (offset < length) {
-		std::string_view instrBytes(
-			reinterpret_cast<const char*>(bytes + offset), length - offset);
+	// ═══════════════════════════════════════════════════════════════════════
+	// Phase 1: Pre-decode all instructions to discover basic block leaders
+	// ═══════════════════════════════════════════════════════════════════════
+	// A "leader" is the first address of a basic block.  Leaders are:
+	//   1. The entry address (always a leader)
+	//   2. The target of any branch (conditional or unconditional)
+	//   3. The fall-through address of a conditional branch
+	//
+	// We decode every instruction once, collect its category, and record
+	// leaders.  This pre-pass does NOT lift — it only decodes.
 
-		// DecodeInstruction requires DecodingContext as 4th parameter
-		if (!arch_->DecodeInstruction(pc, instrBytes, inst, context)) {
-			if (offset == 0) {
-				result.error = "Failed to decode instruction at 0x" +
-					std::to_string(address);
-				return result;
+	struct DecodedInst {
+		remill::Instruction inst;
+		uint64_t pc;
+		size_t size;
+	};
+	std::vector<DecodedInst> decoded;
+	std::set<uint64_t> leaders;
+
+	leaders.insert(address);  // Entry is always a leader
+
+	{
+		remill::Instruction scanInst;
+		uint64_t scanPC = address;
+		size_t scanOffset = 0;
+		auto scanContext = arch_->CreateInitialContext();
+
+		while (scanOffset < length) {
+			std::string_view instrBytes(
+				reinterpret_cast<const char*>(bytes + scanOffset), length - scanOffset);
+
+			if (!arch_->DecodeInstruction(scanPC, instrBytes, scanInst, scanContext)) {
+				break;
 			}
-			break;  // Stop at first undecoded instruction
+
+			DecodedInst di;
+			di.inst = scanInst;
+			di.pc = scanPC;
+			di.size = scanInst.bytes.size();
+			decoded.push_back(di);
+
+			uint64_t nextPC = scanPC + scanInst.bytes.size();
+			uint64_t endAddr = address + length;
+
+			// Check if this instruction is a branch or call
+			// Remill categorizes instructions — check for jumps
+			switch (scanInst.category) {
+			case remill::Instruction::kCategoryDirectJump:
+				// Unconditional jump: target_pc is a leader
+				if (!scanInst.branch_taken_pc) {
+					// Fallback: check operands for the target
+				} else {
+					leaders.insert(scanInst.branch_taken_pc);
+				}
+				break;
+
+			case remill::Instruction::kCategoryConditionalBranch:
+				// Conditional branch: both target and fall-through are leaders
+				if (scanInst.branch_taken_pc) {
+					leaders.insert(scanInst.branch_taken_pc);
+				}
+				if (scanInst.branch_not_taken_pc) {
+					leaders.insert(scanInst.branch_not_taken_pc);
+				} else {
+					leaders.insert(nextPC);
+				}
+				break;
+
+			case remill::Instruction::kCategoryDirectFunctionCall:
+			case remill::Instruction::kCategoryIndirectFunctionCall:
+				// Function call — fall-through is a leader, record call target
+				if (scanOffset + scanInst.bytes.size() < length) {
+					leaders.insert(nextPC);
+				}
+				// Record external call targets for boundary metadata
+				if (options.splitAtCalls && scanInst.branch_taken_pc) {
+					bool isExternal = scanInst.branch_taken_pc < address ||
+					                  scanInst.branch_taken_pc >= endAddr;
+					if (isExternal) {
+						result.callTargets.push_back(scanInst.branch_taken_pc);
+					}
+				}
+				break;
+
+			case remill::Instruction::kCategoryFunctionReturn:
+			case remill::Instruction::kCategoryIndirectJump:
+				// Return or indirect jump — next instruction (if any) is a leader
+				if (scanOffset + scanInst.bytes.size() < length) {
+					leaders.insert(nextPC);
+				}
+				break;
+
+			default:
+				break;
+			}
+
+			scanOffset += scanInst.bytes.size();
+			scanPC = nextPC;
+
+			// ─── Boundary detection: stop if limits are exceeded ─────────
+			if (decoded.size() >= options.maxInstructions) {
+				result.truncated = true;
+				result.truncationReason = "max_instructions";
+				break;
+			}
+			if (leaders.size() >= options.maxBasicBlocks) {
+				result.truncated = true;
+				result.truncationReason = "max_blocks";
+				break;
+			}
+			if (scanOffset >= options.maxBytes) {
+				result.truncated = true;
+				result.truncationReason = "max_bytes";
+				break;
+			}
 		}
 
-		// LiftIntoBlock with 2-arg overload (inst, block)
-		auto status = instLifter->LiftIntoBlock(inst, block, false);
+		// Record where to continue if we truncated
+		if (result.truncated && !decoded.empty()) {
+			auto& lastInst = decoded.back();
+			result.nextAddress = lastInst.pc + lastInst.size;
+		}
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// Phase 2: Create LLVM basic blocks for each leader
+	// ═══════════════════════════════════════════════════════════════════════
+
+	auto func = arch_->DeclareLiftedFunction(
+		"lifted_" + std::to_string(address), liftModule.get());
+	arch_->InitializeEmptyLiftedFunction(func);
+
+	// Map: leader address → BasicBlock
+	std::map<uint64_t, llvm::BasicBlock*> bbMap;
+
+	// The entry block is always the first leader
+	bbMap[address] = &func->getEntryBlock();
+
+	// Create additional blocks for other leaders
+	for (uint64_t leaderAddr : leaders) {
+		if (leaderAddr == address) continue;  // Already have the entry block
+
+		// Only create blocks for leaders that are within our function range
+		uint64_t endAddr = address + length;
+		if (leaderAddr >= address && leaderAddr < endAddr) {
+			auto* bb = llvm::BasicBlock::Create(
+				liftModule->getContext(),
+				"bb_" + std::to_string(leaderAddr),
+				func);
+			bbMap[leaderAddr] = bb;
+		}
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// Phase 3: Lift instructions into their respective basic blocks
+	// ═══════════════════════════════════════════════════════════════════════
+
+	size_t totalOffset = 0;
+
+	// Map from CALLI CallInst* → concrete call target, populated during Phase 3
+	// for every direct function call Remill decodes with a known branch_taken_pc.
+	std::map<llvm::CallInst*, uint64_t> calliTargets;
+
+	for (size_t i = 0; i < decoded.size(); i++) {
+		auto& di = decoded[i];
+
+		// Find the block this instruction belongs to
+		llvm::BasicBlock* currentBlock = nullptr;
+		if (bbMap.count(di.pc)) {
+			currentBlock = bbMap[di.pc];
+		} else {
+			// Find the block whose leader is the highest address <= di.pc
+			auto it = bbMap.upper_bound(di.pc);
+			if (it != bbMap.begin()) {
+				--it;
+				currentBlock = it->second;
+			} else {
+				currentBlock = &func->getEntryBlock();
+			}
+		}
+
+		// Lift the instruction into its block
+		auto status = instLifter->LiftIntoBlock(di.inst, currentBlock, false);
 		if (status != remill::kLiftedInstruction) {
-			if (offset == 0) {
+			if (totalOffset == 0) {
 				result.error = "Failed to lift instruction at 0x" +
-					std::to_string(pc);
+					std::to_string(di.pc);
 				return result;
 			}
 			break;
 		}
 
-		offset += inst.bytes.size();
-		pc += inst.bytes.size();
+		totalOffset += di.size;
+
+		// ─── Record direct call targets ─────────────────────────────────
+		// For direct function calls, Remill's decoder sets branch_taken_pc
+		// to the concrete call target.  Scan the block backwards to find
+		// the CALLI instruction just emitted and store the target address.
+		if (di.inst.branch_taken_pc &&
+			di.inst.category == remill::Instruction::kCategoryDirectFunctionCall) {
+			for (auto it = currentBlock->rbegin(); it != currentBlock->rend(); ++it) {
+				if (auto* CI = llvm::dyn_cast<llvm::CallInst>(&*it)) {
+					auto* calledFn = CI->getCalledFunction();
+					if (calledFn && calledFn->getName().contains("CALLI")) {
+						calliTargets[CI] = di.inst.branch_taken_pc;
+						break;
+					}
+				}
+			}
+		}
+
+		// ─── Wire control flow ──────────────────────────────────────────
+		// After lifting a branch instruction, add LLVM terminators to connect
+		// the blocks.  Remill emits __remill_jump() calls but does NOT create
+		// LLVM br instructions — we must do that ourselves.
+
+		uint64_t nextPC = di.pc + di.size;
+
+		switch (di.inst.category) {
+		case remill::Instruction::kCategoryDirectJump: {
+			// Unconditional jump: br label %target_bb
+			if (di.inst.branch_taken_pc && bbMap.count(di.inst.branch_taken_pc)) {
+				llvm::IRBuilder<> builder(currentBlock);
+				builder.CreateBr(bbMap[di.inst.branch_taken_pc]);
+			}
+			break;
+		}
+
+		case remill::Instruction::kCategoryConditionalBranch: {
+			// Conditional branch: Remill's helper receives BRANCH_TAKEN and
+			// NEXT_PC out-params.  Use those values first instead of guessing
+			// from the last ICmp.  Falling back to ConstantTrue corrupts CFG.
+			if (di.inst.branch_taken_pc && bbMap.count(di.inst.branch_taken_pc)) {
+				uint64_t fallthroughPC = di.inst.branch_not_taken_pc ? 
+					di.inst.branch_not_taken_pc : nextPC;
+
+				llvm::BasicBlock* trueBB = bbMap[di.inst.branch_taken_pc];
+				llvm::BasicBlock* falseBB = bbMap.count(fallthroughPC) ?
+					bbMap[fallthroughPC] : nullptr;
+
+				if (trueBB && falseBB) {
+					llvm::IRBuilder<> builder(currentBlock);
+
+					llvm::Value* cond = nullptr;
+
+					// Preferred: BRANCH_TAKEN written by Remill jump helper.
+					if (auto* branchTakenAlloca = FindNamedAlloca(func, "BRANCH_TAKEN")) {
+						auto* branchTakenTy = branchTakenAlloca->getAllocatedType();
+						auto* rawBranchTaken = builder.CreateLoad(
+							branchTakenTy, branchTakenAlloca, "branch_taken");
+
+						if (branchTakenTy->isIntegerTy(1)) {
+							cond = rawBranchTaken;
+						} else if (branchTakenTy->isIntegerTy()) {
+							cond = builder.CreateICmpNE(
+								rawBranchTaken,
+								llvm::ConstantInt::get(branchTakenTy, 0),
+								"branch_taken.bool");
+						}
+					}
+
+					// Secondary fallback: compare NEXT_PC against the taken target.
+					if (!cond) {
+						if (auto* nextPcAlloca = FindNamedAlloca(func, "NEXT_PC")) {
+							auto* nextPcTy = nextPcAlloca->getAllocatedType();
+							auto* loadedNextPc = builder.CreateLoad(nextPcTy, nextPcAlloca, "next_pc");
+							if (nextPcTy->isIntegerTy(64)) {
+								cond = builder.CreateICmpEQ(
+									loadedNextPc,
+									llvm::ConstantInt::get(nextPcTy, di.inst.branch_taken_pc),
+									"next_pc_is_taken");
+							}
+						}
+					}
+
+					// Legacy fallback: look for the last ICmp in this block.
+					if (!cond) {
+						for (auto it = currentBlock->rbegin(); it != currentBlock->rend(); ++it) {
+							if (auto* icmp = llvm::dyn_cast<llvm::ICmpInst>(&*it)) {
+								cond = icmp;
+								break;
+							}
+						}
+					}
+
+					if (!cond) {
+						// Last-resort fallback keeps the old behavior, but should now
+						// be hit far less often. Prefer conservative false over hardwired
+						// "always take" to reduce CFG distortion when analysis fails.
+						cond = llvm::ConstantInt::getFalse(liftModule->getContext());
+					}
+
+					builder.CreateCondBr(cond, trueBB, falseBB);
+				}
+			}
+			break;
+		}
+
+		case remill::Instruction::kCategoryFunctionReturn: {
+			// Return: ret ptr %memory
+			llvm::IRBuilder<> builder(currentBlock);
+			builder.CreateRet(func->getArg(2));
+			break;
+		}
+
+		case remill::Instruction::kCategoryNormal:
+		case remill::Instruction::kCategoryNoOp: {
+			// Normal instruction: if the NEXT instruction starts a new block,
+			// add a fallthrough branch to connect them
+			if (i + 1 < decoded.size() && bbMap.count(nextPC)) {
+				// Only add branch if this block doesn't already have a terminator
+				if (!currentBlock->getTerminator()) {
+					llvm::IRBuilder<> builder(currentBlock);
+					builder.CreateBr(bbMap[nextPC]);
+				}
+			}
+			break;
+		}
+
+		default:
+			break;
+		}
 	}
 
-	result.bytesConsumed = offset;
+	result.bytesConsumed = totalOffset;
 
-	// Ensure every basic block has a terminator.  Remill's LiftIntoBlock
-	// leaves blocks "open" (no ret/br) because it expects the caller to
-	// wire up control flow.  Without a terminator, Module::print() emits
-	// a block that ends abruptly and parseAssemblyString rejects it with
-	// "expected instruction opcode" at the closing '}'.
+	// ═══════════════════════════════════════════════════════════════════════
+	// Phase 4: Ensure every basic block has a terminator
+	// ═══════════════════════════════════════════════════════════════════════
+	// Remill's LiftIntoBlock leaves blocks "open" (no ret/br).
+	// Add terminators to any blocks that still lack them.
+
 	for (auto &BB : *func) {
 		if (!BB.getTerminator()) {
 			llvm::IRBuilder<> builder(&BB);
-			// The lifted function signature is: ptr (ptr %state, i64 %pc, ptr %memory)
-			// Return the memory pointer (3rd argument) to match the Remill convention.
+			// Return the memory pointer (3rd argument) to match Remill convention.
 			builder.CreateRet(func->getArg(2));
 		}
 	}
 
-	// Print the lifted function IR including all type definitions it needs.
-	// We use Module::print() on a stripped module (see below) which
-	// correctly emits ALL type definitions, declarations, metadata nodes,
-	// and the function body.  Previous approach of manually collecting
-	// types from GEP instructions was fragile and missed transitive
-	// dependencies (causing "base element of getelementptr must be sized"
-	// errors when the IR was re-parsed by Rellic).
+	// ═══════════════════════════════════════════════════════════════════════
+	// Phase 4.5: Resolve NEXT_PC constant propagation for call targets
+	// ═══════════════════════════════════════════════════════════════════════
+	// Remill emits each direct call target as:
+	//   store i64 %program_counter, ptr %NEXT_PC     ; initial (runtime arg)
+	//   ...
+	//   %a = add i64 %prev_next_pc, instr_size
+	//   store i64 %a, ptr %NEXT_PC
+	//   %b = load i64, ptr %NEXT_PC                  ; always right after store
+	//   %target = sub i64 %b, rel32_displacement
+	//   call @CALLI(..., i64 %target, ...)
+	//
+	// Since %program_counter is a known constant (= address passed to DoLift),
+	// substituting it + forwarding NEXT_PC stores makes all direct call targets
+	// resolve to concrete i64 constants, eliminating "sub_(vN ± offset)" noise
+	// in the Helix decompiler output.
+	{
+		// Step 1: Replace %program_counter argument with the concrete address.
+		// It is the sole i64 argument at index 1 (State* is 0, Memory* is 2).
+		llvm::Value* pcArg = nullptr;
+		{
+			unsigned idx = 0;
+			for (auto& arg : func->args()) {
+				if (idx == 1 && arg.getType()->isIntegerTy(64)) {
+					pcArg = &arg;
+					break;
+				}
+				++idx;
+			}
+		}
+		if (pcArg) {
+			auto* concretePC = llvm::ConstantInt::get(
+				llvm::Type::getInt64Ty(liftModule->getContext()), address);
+			pcArg->replaceAllUsesWith(concretePC);
+		}
 
-	// --- Build IR string using Module::print() ---
-	// Instead of manually collecting types, declarations, and metadata,
-	// we strip the cloned module down to only the lifted function and
-	// its dependencies, then use Module::print() which correctly emits
-	// ALL type definitions, function declarations, metadata nodes, and
-	// the function body.  This is the most robust approach — LLVM knows
-	// how to serialize its own modules.
+		// Step 1.5: Inject concrete call targets recorded during Phase 3.
+		// Directly replaces CALLI target arguments (arg index 2) with the
+		// concrete address decoded by Remill — no NEXT_PC propagation needed.
+		// This fixes all direct call targets regardless of CFG topology.
+		for (auto& [CI, target] : calliTargets) {
+			auto* targetConst = llvm::ConstantInt::get(
+				llvm::Type::getInt64Ty(liftModule->getContext()), target);
+			if (CI->arg_size() > 2)
+				CI->setArgOperand(2, targetConst);
+		}
 
-	// Aggressively strip the cloned module down to ONLY the lifted
-	// function and its direct dependencies.  The semantics module
-	// contains thousands of ISEL_* globals and instruction semantics
-	// functions that bloat the IR and can cause parse errors in Rellic.
-	// We keep: the lifted function, functions it calls (as declarations),
-	// and globals it references.  Everything else is removed.
+		// Step 2: Find the %NEXT_PC alloca in the entry block, then build
+		// sets of its load/store users directly from the USE-DEF chain.
+		// Using users() avoids fragile getPointerOperand() pointer comparison.
+		llvm::AllocaInst* nextPCAlloca = nullptr;
+		for (auto& I : func->getEntryBlock()) {
+			if (auto* AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
+				if (AI->hasName() && AI->getName() == "NEXT_PC") {
+					nextPCAlloca = AI;
+					break;
+				}
+			}
+		}
+
+		// Step 3: Multi-pass inter-block + intra-block store-to-load forwarding.
+		// For single-predecessor blocks, inherit the predecessor's outgoing value.
+		// Repeat until no more loads can be forwarded.
+		if (nextPCAlloca) {
+			// Collect load/store users via USE-DEF chain (not pointer comparison).
+			std::set<llvm::Instruction*> nextPCLoadSet;
+			std::set<llvm::Instruction*> nextPCStoreSet;
+			for (auto* U : nextPCAlloca->users()) {
+				if (llvm::isa<llvm::LoadInst>(U))
+					nextPCLoadSet.insert(llvm::cast<llvm::Instruction>(U));
+				else if (llvm::isa<llvm::StoreInst>(U))
+					nextPCStoreSet.insert(llvm::cast<llvm::Instruction>(U));
+			}
+
+			// Propagate: repeat until stable (handles single-predecessor chains).
+			std::map<llvm::BasicBlock*, llvm::Value*> blockOutgoing;
+			bool fwdChanged = true;
+			while (fwdChanged) {
+				fwdChanged = false;
+				for (auto& BB : *func) {
+					// Inherit incoming value from single predecessor if known.
+					llvm::Value* lastStored = nullptr;
+					if (auto* pred = BB.getSinglePredecessor()) {
+						// Only inherit NEXT_PC across an edge when the predecessor
+						// has a single successor. For conditional branches, the outgoing
+						// NEXT_PC is path-dependent; blindly forwarding it corrupts the
+						// target block's synthetic PC/NEXT_PC stamp.
+						auto* predTerm = pred->getTerminator();
+						const bool safeSingleSuccessor =
+							predTerm && predTerm->getNumSuccessors() == 1;
+						if (safeSingleSuccessor) {
+							auto it = blockOutgoing.find(pred);
+							if (it != blockOutgoing.end())
+								lastStored = it->second;
+						}
+					}
+
+					std::vector<std::pair<llvm::LoadInst*, llvm::Value*>> toReplace;
+					for (auto& I : BB) {
+						if (auto* SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+							if (nextPCStoreSet.count(SI))
+								lastStored = SI->getValueOperand();
+						} else if (auto* LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+							if (nextPCLoadSet.count(LI) && lastStored)
+								toReplace.push_back({LI, lastStored});
+						}
+					}
+
+					for (auto& [LI, val] : toReplace) {
+						LI->replaceAllUsesWith(val);
+						LI->eraseFromParent();
+						nextPCLoadSet.erase(LI);
+						fwdChanged = true;
+					}
+
+					if (lastStored)
+						blockOutgoing[&BB] = lastStored;
+				}
+			}
+		}
+
+		// Step 4: Fold constant binary operations (add/sub/mul/and/or/xor) that
+		// now have two ConstantInt operands as a result of the substitutions above.
+		bool changed = true;
+		while (changed) {
+			changed = false;
+			for (auto& BB : *func) {
+				for (auto it = BB.begin(); it != BB.end(); ) {
+					auto& I = *it++;
+					auto* BO = llvm::dyn_cast<llvm::BinaryOperator>(&I);
+					if (!BO) continue;
+
+					auto* C0 = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(0));
+					auto* C1 = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(1));
+					if (!C0 || !C1) continue;
+
+					uint64_t v0 = C0->getZExtValue();
+					uint64_t v1 = C1->getZExtValue();
+					uint64_t result = 0;
+					bool foldable = true;
+
+					switch (BO->getOpcode()) {
+						case llvm::Instruction::Add: result = v0 + v1; break;
+						case llvm::Instruction::Sub: result = v0 - v1; break;
+						case llvm::Instruction::Mul: result = v0 * v1; break;
+						case llvm::Instruction::And: result = v0 & v1; break;
+						case llvm::Instruction::Or:  result = v0 | v1; break;
+						case llvm::Instruction::Xor: result = v0 ^ v1; break;
+						default: foldable = false; break;
+					}
+
+					if (!foldable) continue;
+
+					auto* folded = llvm::ConstantInt::get(BO->getType(), result);
+					BO->replaceAllUsesWith(folded);
+					BO->eraseFromParent();
+					changed = true;
+				}
+			}
+		}
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// Phase 5: Strip module (same as before)
+	// ═══════════════════════════════════════════════════════════════════════
+
 	{
 		// 1. Collect all Values reachable from the lifted function
 		std::set<llvm::Function*> reachableFunctions;
@@ -520,8 +988,7 @@ LiftResult RemillLifter::DoLift(
 			}
 		}
 
-		// 2. Remove all aliases (they reference ISEL functions and
-		//    can cause parse errors)
+		// 2. Remove all aliases
 		std::vector<llvm::GlobalAlias*> aliasesToRemove;
 		for (auto &A : liftModule->aliases()) {
 			aliasesToRemove.push_back(&A);
@@ -541,8 +1008,7 @@ LiftResult RemillLifter::DoLift(
 			IF->eraseFromParent();
 		}
 
-		// 4. Remove unreachable globals first (breaks references
-		//    that keep functions alive)
+		// 4. Remove unreachable globals
 		std::vector<llvm::GlobalVariable*> gvToRemove;
 		for (auto &GV : liftModule->globals()) {
 			if (reachableGlobals.count(&GV) == 0) {
@@ -574,12 +1040,9 @@ LiftResult RemillLifter::DoLift(
 		}
 
 		// 7. Remove named metadata that may reference deleted values
-		//    (e.g. !llvm.module.flags, !llvm.ident are safe to keep,
-		//    but others may cause parse errors)
 		std::vector<llvm::NamedMDNode*> namedMDToRemove;
 		for (auto &NMD : liftModule->named_metadata()) {
 			llvm::StringRef name = NMD.getName();
-			// Keep only essential module-level metadata
 			if (name != "llvm.module.flags" && name != "llvm.ident" &&
 				!name.starts_with("remill")) {
 				namedMDToRemove.push_back(&NMD);
@@ -590,9 +1053,83 @@ LiftResult RemillLifter::DoLift(
 		}
 	}
 
-	// Print the stripped module — this emits everything correctly:
-	// target triple, data layout, type definitions, declarations,
-	// the lifted function, and all metadata nodes.
+	// ═══════════════════════════════════════════════════════════════════════
+	// Phase 5.5: Run LLVM optimization passes to clean up the IR
+	// ═══════════════════════════════════════════════════════════════════════
+	// Remill generates verbose IR with many redundant store/load patterns
+	// through the State struct.  Running standard LLVM passes dramatically
+	// reduces IR size and improves downstream decompilation quality.
+	//
+	// Pipeline: SROA → mem2reg → instcombine → simplifycfg → DCE → ADCE
+	//   - SROA:        breaks aggregate allocas into scalar SSA values
+	//   - mem2reg:     promotes remaining allocas to SSA registers
+	//   - EarlyCSE:    eliminates common subexpressions (redundant loads)
+	//   - instcombine: folds/simplifies instruction sequences
+	//   - simplifycfg: merges trivial blocks, removes dead branches
+	//   - DCE:         removes dead instructions
+	//   - ADCE:        aggressive dead code elimination (catches more)
+	//   - DSE:         dead store elimination (removes unused State writes)
+
+	if (options.optimizeIR) {
+		// Create analysis managers
+		llvm::LoopAnalysisManager LAM;
+		llvm::FunctionAnalysisManager FAM;
+		llvm::CGSCCAnalysisManager CGAM;
+		llvm::ModuleAnalysisManager MAM;
+
+		// Create pass builder and register analyses
+		llvm::PassBuilder PB;
+		PB.registerModuleAnalyses(MAM);
+		PB.registerCGSCCAnalyses(CGAM);
+		PB.registerFunctionAnalyses(FAM);
+		PB.registerLoopAnalyses(LAM);
+		PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+		// Build function pass pipeline
+		llvm::FunctionPassManager FPM;
+		FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+		FPM.addPass(llvm::PromotePass());            // mem2reg
+		FPM.addPass(llvm::EarlyCSEPass());            // common subexpression elimination
+		FPM.addPass(llvm::InstCombinePass());          // instruction combining
+		FPM.addPass(llvm::SimplifyCFGPass());          // simplify control flow graph
+		FPM.addPass(llvm::DCEPass());                  // dead code elimination
+		FPM.addPass(llvm::ADCEPass());                 // aggressive dead code elimination
+		FPM.addPass(llvm::DSEPass());                  // dead store elimination
+
+		// Second round: instcombine + simplifycfg after DSE may expose more
+		FPM.addPass(llvm::InstCombinePass());
+		FPM.addPass(llvm::SimplifyCFGPass());
+
+		// Run on all functions in the module (primarily the lifted function)
+		llvm::ModulePassManager MPM;
+		MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+		MPM.run(*liftModule, MAM);
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// Phase 6: Name all unnamed instructions to avoid SSA numbering issues
+	// ═══════════════════════════════════════════════════════════════════════
+	// Multi-block lifting inserts instructions into different blocks out of
+	// creation order, and the strip phase removes referenced values.  This
+	// can leave gaps/duplicates in the automatic numbering (%0, %1, ...).
+	// Giving every value an explicit name sidesteps the issue entirely.
+	{
+		unsigned counter = 0;
+		for (auto &F : *liftModule) {
+			for (auto &BB : F) {
+				if (!BB.hasName()) {
+					BB.setName("bb_" + std::to_string(counter++));
+				}
+				for (auto &I : BB) {
+					if (!I.hasName() && !I.getType()->isVoidTy()) {
+						I.setName("v" + std::to_string(counter++));
+					}
+				}
+			}
+		}
+	}
+
+	// Print the stripped module
 	std::string irStr;
 	llvm::raw_string_ostream os(irStr);
 	liftModule->print(os, nullptr);
@@ -614,6 +1151,23 @@ Napi::Object RemillLifter::LiftResultToJS(
 		static_cast<double>(result.address)));
 	obj.Set("bytesConsumed", Napi::Number::New(env,
 		static_cast<double>(result.bytesConsumed)));
+
+	// Boundary detection metadata
+	obj.Set("truncated", Napi::Boolean::New(env, result.truncated));
+	obj.Set("nextAddress", Napi::Number::New(env,
+		static_cast<double>(result.nextAddress)));
+	if (!result.truncationReason.empty()) {
+		obj.Set("truncationReason", Napi::String::New(env, result.truncationReason));
+	}
+
+	// External call targets discovered during lifting
+	auto targets = Napi::Array::New(env, result.callTargets.size());
+	for (size_t i = 0; i < result.callTargets.size(); i++) {
+		targets.Set(static_cast<uint32_t>(i), Napi::Number::New(env,
+			static_cast<double>(result.callTargets[i])));
+	}
+	obj.Set("callTargets", targets);
+
 	return obj;
 }
 

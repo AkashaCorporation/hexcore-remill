@@ -49,6 +49,24 @@ export const OS: {
 };
 
 /**
+ * Options to control lifting boundaries and IR optimization.
+ *
+ * All fields are optional — sensible defaults are applied when omitted.
+ */
+export interface LiftOptions {
+	/** Max decoded instructions per lift (default: 2000) */
+	maxInstructions?: number;
+	/** Max basic block leaders (default: 500) */
+	maxBasicBlocks?: number;
+	/** Max bytes to decode (default: 32768 / 32KB) */
+	maxBytes?: number;
+	/** Record external CALL targets in result (default: true) */
+	splitAtCalls?: boolean;
+	/** Run LLVM optimization passes: mem2reg, instcombine, simplifycfg, dce (default: true) */
+	optimizeIR?: boolean;
+}
+
+/**
  * Result of a lift operation.
  */
 export interface LiftResult {
@@ -62,6 +80,14 @@ export interface LiftResult {
 	address: number;
 	/** Number of input bytes that were successfully consumed */
 	bytesConsumed: number;
+	/** True if lifting was truncated by boundary limits */
+	truncated: boolean;
+	/** Address where to continue lifting if truncated */
+	nextAddress: number;
+	/** Reason for truncation: "max_instructions" | "max_blocks" | "max_bytes" */
+	truncationReason?: string;
+	/** External CALL target addresses discovered during lifting */
+	callTargets: number[];
 }
 
 /**
@@ -129,9 +155,10 @@ export class RemillLifter {
 	 *
 	 * @param code - Buffer containing raw machine code
 	 * @param address - Virtual address of the first byte
+	 * @param options - Optional lift options for boundary detection and IR optimization
 	 * @returns Lift result with LLVM IR text
 	 */
-	liftBytes(code: Buffer | Uint8Array, address: number | bigint): LiftResult;
+	liftBytes(code: Buffer | Uint8Array, address: number | bigint, options?: LiftOptions): LiftResult;
 
 	/**
 	 * Lift raw machine code bytes to LLVM IR (asynchronous).

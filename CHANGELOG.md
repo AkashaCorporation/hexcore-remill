@@ -2,6 +2,24 @@
 
 All notable changes to `hexcore-remill` will be documented in this file.
 
+## [0.2.0] - 2026-03-22
+
+### Added
+
+- **LLVM optimization passes** — new Phase 5.5 runs SROA, mem2reg, EarlyCSE, InstCombine, SimplifyCFG, DCE, ADCE, and DSE on lifted IR. Reduces IR size by ~55% (e.g. 16,700 lines → 7,500 lines) and dramatically improves downstream decompilation quality.
+- **Boundary detection** — `LiftOptions` struct with configurable limits: `maxInstructions` (default: 2000), `maxBasicBlocks` (default: 500), `maxBytes` (default: 32KB). Prevents oversized IR from overwhelming decompilers.
+- **CALL target recording** — discovers and reports external function call targets in `LiftResult.callTargets` for cross-function analysis.
+- **Truncation metadata** — `LiftResult` now includes `truncated`, `nextAddress`, and `truncationReason` fields for chunked lifting of large functions.
+- **SSA naming fix** — Phase 6 names all unnamed LLVM values (`%v0`, `%v1`, ...) to prevent SSA numbering errors when parsing generated `.ll` files.
+- **CALL fall-through leaders** — function call instructions now correctly create basic block boundaries at their fall-through addresses.
+
+### Changed
+
+- `liftBytes()` now accepts an optional third argument (`LiftOptions`) for boundary and optimization control.
+- `LiftResult` interface extended with boundary detection fields (`truncated`, `nextAddress`, `truncationReason`, `callTargets`).
+- `DoLift()` C++ signature now accepts `const LiftOptions&` parameter.
+- Default behavior change: lifting now applies optimization passes and boundary limits by default. Use `{ optimizeIR: false }` to get raw unoptimized IR.
+
 ## [0.1.2] - 2026-02-15
 
 ### Fixed
