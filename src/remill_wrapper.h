@@ -12,6 +12,7 @@
 #include <napi.h>
 #include <string>
 #include <vector>
+#include <map>
 #include <memory>
 #include <cstdint>
 
@@ -27,6 +28,17 @@ class IntrinsicTable;
 }  // namespace remill
 
 /**
+ * Lifting mode — selects format-specific heuristics in Phase 1.
+ */
+enum class LiftMode {
+	Generic,         // Current default behavior (no format assumptions)
+	PE64,            // Trust .pdata function boundaries, handle int3 padding,
+	                 // stop at known function ends, treat out-of-range jmp as tail call
+	ElfRelocatable   // Use symtab boundaries, skip ftrace preamble,
+	                 // treat retpoline thunks as returns (FIX-019)
+};
+
+/**
  * Options to control lifting boundaries and prevent oversized IR.
  */
 struct LiftOptions {
@@ -35,6 +47,20 @@ struct LiftOptions {
 	size_t maxBytes        = 32768;   // Max bytes to decode (32KB)
 	bool   splitAtCalls    = true;    // Record external CALL targets
 	bool   optimizeIR      = true;    // Run LLVM passes (mem2reg, instcombine, simplifycfg, dce)
+	bool   inlineSemantics = false;   // Preserve named semantic calls by default for downstream decompilers
+
+	// --- Item 2: Additional BB leaders from external analysis ---
+	// Extra basic block entry points discovered by TypeScript (jump table targets,
+	// .pdata function boundaries, ELF symtab addresses within range).
+	// Injected into the leaders set after Phase 1 scan, before Phase 2.
+	std::vector<uint64_t> additionalLeaders;
+
+	// --- Item 3: Format-specific lifting mode ---
+	LiftMode mode = LiftMode::Generic;
+
+	// PE64-specific: function end addresses from .pdata exception directory.
+	// Phase 1 stops scanning when it hits one of these addresses.
+	std::vector<uint64_t> knownFunctionEnds;
 };
 
 /**
@@ -52,6 +78,9 @@ struct LiftResult {
 	uint64_t nextAddress = 0;          // Where to continue lifting (valid if truncated)
 	std::vector<uint64_t> callTargets; // Discovered external CALL targets
 	std::string truncationReason;      // "max_instructions" | "max_blocks" | "max_bytes"
+
+	// Register analysis metadata
+	std::vector<std::string> implicitParams; // Registers read before written (function params)
 };
 
 /**
@@ -82,10 +111,16 @@ private:
 	static Napi::Value GetSupportedArchs(const Napi::CallbackInfo& info);
 	Napi::Value Close(const Napi::CallbackInfo& info);
 	Napi::Value IsOpen(const Napi::CallbackInfo& info);
+	Napi::Value SetExternalSymbols(const Napi::CallbackInfo& info);
+	Napi::Value ClearExternalSymbols(const Napi::CallbackInfo& info);
 
 	// --- State ---
 	std::string archName_;
 	bool closed_ = false;
+
+	// FIX-011: External symbol map (fakeAddr → symbol name) for ET_REL relocations.
+	// Set from JS before liftBytes(); used after lifting to resolve CALLI targets.
+	std::map<uint64_t, std::string> externalSymbols_;
 
 	std::unique_ptr<llvm::LLVMContext> context_;
 	std::unique_ptr<llvm::Module> semanticsModule_;
@@ -102,7 +137,8 @@ public:
 		Napi::Env env,
 		RemillLifter* lifter,
 		std::vector<uint8_t> bytes,
-		uint64_t address);
+		uint64_t address,
+		LiftOptions options);
 
 	void Execute() override;
 	void OnOK() override;
@@ -114,6 +150,7 @@ private:
 	RemillLifter* lifter_;
 	std::vector<uint8_t> bytes_;
 	uint64_t address_;
+	LiftOptions options_;
 	LiftResult result_;
 	Napi::Promise::Deferred deferred_;
 };
