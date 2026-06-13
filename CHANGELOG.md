@@ -2,6 +2,17 @@
 
 All notable changes to `hexcore-remill` will be documented in this file.
 
+## [0.5.0] - 2026-06-12 — "AArch64 Lifting + Callfuscation Deflattening"
+
+### Added
+
+- **FIX-053 — AArch64 (ARM64) lifting enabled.** The Supported Architectures table has always listed `aarch64` / `aarch64_little_endian`, but the lift path was previously exercised only on x86 / x86-64. `DoLift` now wires the Remill AArch64 semantics through per-instruction lifting and the Phase 3 block-terminator handling, so ARM64 machine code lifts to LLVM IR end-to-end for the Helix decompiler. (issue #29)
+- **FIX-052 / FIX-052b — Deflattened-callfuscation chain lifting.** When the disassembler reports a deflattened call-as-jmp (callfuscation) control-flow chain — the `call <next>; pop` gadget chain rewritten to a jmp chain — the wrapper now lifts the entire deflattened jmp-chain as ONE multi-block function instead of stopping at the first synthetic edge. The `branch_taken_pc` leader / edge handling was extended so the chained blocks wire their fall-through and taken edges correctly, keeping the function whole for downstream structuring.
+
+### Notes
+
+- Source synced from the in-tree `hexcore-remill` extension (the validated `.node` source that ships in HexCore 3.8.2). `main.cpp` is unchanged; the wrapper (`remill_wrapper.cpp` / `remill_wrapper.h`) carries the FIX-052 / FIX-053 deltas (+355 lines). The AArch64 prebuild requires the Remill deps to include the AArch64 semantics target.
+
 ## [0.4.0] - 2026-04-19 — "Kernel Corpus Readiness"
 
 ### Added

@@ -10,7 +10,7 @@ This package is **not a thin wrapper** over upstream Remill. The N-API scaffold 
 
 Instead, the scaffold in this fork has been extended to do part of what Anvill would normally do at the pre-lift stage. CFG discovery, basic-block leader collection, function-boundary detection, and jump-table target resolution are handled by **Pathfinder**, a sibling extension (`hexcore-pathfinder`) that runs before Remill and feeds the discovered leaders into `LiftOptions.additionalLeaders`. Everything downstream of Remill — variable recovery, stack-frame recovery, calling-convention recovery, type inference, struct-field reconstruction — is handled by **Helix** (`HexCore-Helix`), the MLIR-based decompiler engine that consumes the IR we produce here. So `Pathfinder → this fork → Helix` together fill the role that `Anvill + Remill` fills in the Trail of Bits pipeline.
 
-Because this is the specific configuration we target, the fork also implements desync-recovery, synthetic-NOP handling, and CFG-completeness fixes that aren't in upstream Remill. These are documented in `CHANGELOG.md` under the `FIX-0NN` tags.
+Because this is the specific configuration we target, the fork also implements desync-recovery, synthetic-NOP handling, CFG-completeness fixes, AArch64 (ARM64) lifting, and deflattened-callfuscation chain lifting that aren't in upstream Remill. These are documented in `CHANGELOG.md` under the `FIX-0NN` tags.
 
 ## Supported Architectures
 
